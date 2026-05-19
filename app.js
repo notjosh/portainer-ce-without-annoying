@@ -3,7 +3,6 @@ const http = require('http');
 const fs = require('fs');
 const spawn = require('child_process').spawn;
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
 
 const INJECTED_HTML = `
   <style>
@@ -52,64 +51,73 @@ const SSL_KEY_PATH = '/data/certs/key.pem';
 const FORWARDED_ARGS = process.argv.slice(2);
 
 // proxy logic
-const app = express();
-app.get('/', async (req, res) => {
-  try {
-    const response = await fetch(TARGET_URL);
-    const body = await response.text();
-    const newBody = body.replace('<head>', `<head>${INJECTED_HTML}`);
-    res.send(newBody);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json(e);
-  }
-});
-app.get('/api/motd', (req, res) => {
-  // hide the "Latest News From Portainer"
-  // https://github.com/portainer/portainer/blob/master/app/portainer/views/home/home.html
-  res.json({});
-});
-app.use(createProxyMiddleware({
-  target: TARGET_URL,
-  ws: true,
-}));
-
-// http + https server
-async function waitUntilCertAvailable() {
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  while (!fs.existsSync(SSL_CERT_PATH)) {
-    await sleep(1000);
-  }
-};
-async function runServer() {
-  http.createServer(app).listen(9000);
-  await waitUntilCertAvailable();
-  https.createServer({
-    key: fs.readFileSync(SSL_KEY_PATH),
-    cert: fs.readFileSync(SSL_CERT_PATH),
-  }, app).listen(9443);
-}
-
-// child process for portainer
-function runPortainer() {
-  const fwdArgs = FORWARDED_ARGS.join(' ');
-  console.log(`Launching portainer with args ${fwdArgs}`)
-  const child = spawn('/bin/sh', [
-    '-c',
-    `/portainer --bind=":19000" --bind-https=":19443" ${fwdArgs}`
-  ]);
-  child.stdout.pipe(process.stdout);
-  child.stderr.pipe(process.stderr);
-  child.on('exit', function (code) {
-    console.log(`portainer exited with status code ${code}`);
-    process.exit(code);
+(async () => {
+  // http-proxy-middleware is ESM-only in current releases, so load it dynamically
+  // from this CommonJS entrypoint instead of pinning an older package version.
+  const { createProxyMiddleware } = await import('http-proxy-middleware');
+  
+  const app = express();
+  app.get('/', async (req, res) => {
+    try {
+      const response = await fetch(TARGET_URL);
+      const body = await response.text();
+      const newBody = body.replace('<head>', `<head>${INJECTED_HTML}`);
+      res.send(newBody);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json(e);
+    }
   });
-  process.on('SIGTERM', function () {
-    child.kill('SIGTERM');
+  app.get('/api/motd', (req, res) => {
+    // hide the "Latest News From Portainer"
+    // https://github.com/portainer/portainer/blob/master/app/portainer/views/home/home.html
+    res.json({});
   });
-}
+  app.use(createProxyMiddleware({
+    target: TARGET_URL,
+    ws: true,
+  }));
 
-// run it
-runPortainer();
-runServer();
+  // http + https server
+  async function waitUntilCertAvailable() {
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    while (!fs.existsSync(SSL_CERT_PATH)) {
+      await sleep(1000);
+    }
+  };
+  async function runServer() {
+    http.createServer(app).listen(9000);
+    await waitUntilCertAvailable();
+    https.createServer({
+      key: fs.readFileSync(SSL_KEY_PATH),
+      cert: fs.readFileSync(SSL_CERT_PATH),
+    }, app).listen(9443);
+  }
+
+  // child process for portainer
+  function runPortainer() {
+    const fwdArgs = FORWARDED_ARGS.join(' ');
+    console.log(`Launching portainer with args ${fwdArgs}`)
+    const child = spawn('/bin/sh', [
+      '-c',
+      `/portainer --bind=":19000" --bind-https=":19443" ${fwdArgs}`
+    ]);
+    child.stdout.pipe(process.stdout);
+    child.stderr.pipe(process.stderr);
+    child.on('exit', function (code) {
+      console.log(`portainer exited with status code ${code}`);
+      process.exit(code);
+    });
+    process.on('SIGTERM', function () {
+      child.kill('SIGTERM');
+    });
+  }
+
+  // run it
+  runPortainer();
+  runServer();
+})().catch((error) => {
+  console.error('Failed to start proxy wrapper', error);
+  process.exit(1);
+});
 
