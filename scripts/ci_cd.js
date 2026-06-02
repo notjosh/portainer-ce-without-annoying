@@ -3,7 +3,8 @@ const { spawn } = require('child_process');
 
 const ACCEPTED_TAGS_FROM = '2.17.0';
 const UPSTREAM_REPO = 'portainer/portainer-ce';
-const OUTPUT_REPO = 'ngxson/portainer-ce-without-annoying';
+const OUTPUT_OWNER = 'notjosh';
+const OUTPUT_PACKAGE = 'portainer-ce-without-annoying';
 const NUMBER_OF_TAGS_REBUILD = 5;
 
 const shouldRebuild = !!process.argv.join(' ').match(/rebuild=true/);
@@ -38,17 +39,8 @@ function semverToInt(semver) {
 
 /////////////////////////////////////
 
-/**
- * Prompt to ChatGPT: now, I have docker hub api to return a list of tags of a repo, it's in results[i].name (a semver string)
- * the api url is `https://hub.docker.com/v2/repositories/${repoName}/tags/`
- * write nodejs code using fetch (async - await) to:
- * 1. fetch name of all tags of repo_a and repo_b
- * 2. get a list of difference of tags between the 2 (for example, repo_a has tag 1, 2, 3 and repo_b has 1, 2 ==> difference of tags is the "3")
- * 3. for each difference of tags, call build_and_push(tag)
- */
-
-// Utility function to fetch tags for a given repo
-async function fetchTags(repoName) {
+// Fetch upstream (Docker Hub) tags for portainer/portainer-ce
+async function fetchUpstreamTags(repoName) {
   const url = `https://hub.docker.com/v2/repositories/${repoName}/tags/?page_size=50&page=1`;
   const response = await fetch(url);
   return (await response.json())
@@ -56,16 +48,45 @@ async function fetchTags(repoName) {
     .filter(t => t.match(/^(latest|[\d.]+)$/));
 }
 
-// Utility function to find the difference between two tag arrays
+// Fetch already-published tags from GHCR via GitHub Packages REST API.
+// Returns [] if the package doesn't exist yet (first run).
+async function fetchGhcrTags(owner, packageName) {
+  const headers = {
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (process.env.GITHUB_TOKEN) {
+    headers['Authorization'] = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+
+  const tags = new Set();
+  let page = 1;
+  while (true) {
+    const url = `https://api.github.com/users/${owner}/packages/container/${packageName}/versions?per_page=100&page=${page}`;
+    const response = await fetch(url, { headers });
+    if (response.status === 404) return [];
+    if (!response.ok) {
+      throw new Error(`GHCR API ${response.status}: ${await response.text()}`);
+    }
+    const versions = await response.json();
+    if (!Array.isArray(versions) || versions.length === 0) break;
+    for (const v of versions) {
+      for (const t of (v.metadata?.container?.tags ?? [])) tags.add(t);
+    }
+    if (versions.length < 100) break;
+    page++;
+  }
+  return [...tags].filter(t => t.match(/^(latest|[\d.]+)$/));
+}
+
 function findTagDifference(tagsA, tagsB) {
   return tagsA.filter(tag => !tagsB.includes(tag));
 }
 
-// Main function to fetch tags, find the difference, and call build_and_push
-async function processRepos(repoA, repoB) {
+async function processRepos(upstreamRepo, outputOwner, outputPackage) {
   try {
-    const tagsA = await fetchTags(repoA);
-    const tagsB = await fetchTags(repoB);
+    const tagsA = await fetchUpstreamTags(upstreamRepo);
+    const tagsB = await fetchGhcrTags(outputOwner, outputPackage);
     console.log({ tagsA, tagsB });
 
     const tagDifference = shouldRebuild
@@ -98,4 +119,4 @@ async function processRepos(repoA, repoB) {
   }
 }
 
-processRepos(UPSTREAM_REPO, OUTPUT_REPO);
+processRepos(UPSTREAM_REPO, OUTPUT_OWNER, OUTPUT_PACKAGE);

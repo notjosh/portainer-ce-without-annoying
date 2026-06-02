@@ -12,9 +12,15 @@ This is a drop-in replacement for [portainer/portainer-ce](https://hub.docker.co
 
 **Bonus**: tracking script is also removed. See [this issue](https://github.com/ngxson/portainer-ce-without-annoying/issues/5)
 
+## Fork history
+
+The original project [ngxson/portainer-ce-without-annoying](https://github.com/ngxson/portainer-ce-without-annoying) is abandoned. [michaelmendoza42/portainer-ce-without-annoying](https://github.com/michaelmendoza42/portainer-ce-without-annoying) fixed the issues; this fork exists to publish that work to GHCR so it can be pulled without depending on Docker Hub.
+
+Images are published to [`ghcr.io/notjosh/portainer-ce-without-annoying`](https://github.com/notjosh/portainer-ce-without-annoying/pkgs/container/portainer-ce-without-annoying).
+
 ## How to use
 
-If you already have `portainer-ce` installation, just replace `portainer/portainer-ce:latest` with `ngxson/portainer-ce-without-annoying:latest`
+If you already have `portainer-ce` installation, just replace `portainer/portainer-ce:latest` with `ghcr.io/notjosh/portainer-ce-without-annoying:latest`
 
 For example, if you use the command from the [official installation guide](https://docs.portainer.io/start/install-ce/server/docker/linux), the command will be:
 
@@ -26,7 +32,7 @@ docker run -d \
   --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v portainer_data:/data \
-  ngxson/portainer-ce-without-annoying:latest
+  ghcr.io/notjosh/portainer-ce-without-annoying:latest
 ```
 
-Alternatively, you can use [this docker-compose.yml](https://github.com/ngxson/portainer-ce-without-annoying/blob/master/docker-compose.yml)
+Alternatively, you can use [this docker-compose.yml](https://github.com/notjosh/portainer-ce-without-annoying/blob/main/docker-compose.yml)
