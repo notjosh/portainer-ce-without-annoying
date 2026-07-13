@@ -6,7 +6,7 @@ set -euo pipefail
 # even if upstream re-points a tag mid-run. Invoked by ci_cd.js.
 
 IMAGE="ghcr.io/notjosh/portainer-ce-without-annoying"
-ARCHS="linux/amd64,linux/arm64,linux/arm/v7"
+ARCHS="linux/amd64,linux/arm64"
 SOURCE_URL="https://github.com/notjosh/portainer-ce-without-annoying"
 
 : "${TAG:?Please set TAG environment variable (output tag, e.g. 2.43.0)}"
