@@ -18,9 +18,20 @@ The original project [ngxson/portainer-ce-without-annoying](https://github.com/n
 
 Images are published to [`ghcr.io/notjosh/portainer-ce-without-annoying`](https://github.com/notjosh/portainer-ce-without-annoying/pkgs/container/portainer-ce-without-annoying).
 
+## Tags
+
+Tags mirror [upstream's](https://hub.docker.com/r/portainer/portainer-ce/tags):
+
+- `2.x.y`: a specific release, built from the upstream tag of the same name (pinned by digest).
+- `lts`: the current long-term support release. **Use this unless you know you want otherwise.**
+- `sts`: the current short-term support release (newer features, shorter support window).
+- `latest`: mirrors upstream `latest`, which follows the **LTS** line, *not* the newest release. Prefer `lts` or `sts` to make the intent explicit.
+
+Alias tags (`latest`/`lts`/`sts`) are re-pointed at the matching numbered build on every CI run (daily), by comparing upstream digests; they are never independent builds. Each run's [Actions summary](https://github.com/notjosh/portainer-ce-without-annoying/actions) shows exactly which version each alias points to.
+
 ## How to use
 
-If you already have `portainer-ce` installation, just replace `portainer/portainer-ce:latest` with `ghcr.io/notjosh/portainer-ce-without-annoying:latest`
+If you already have `portainer-ce` installation, just replace `portainer/portainer-ce:latest` with `ghcr.io/notjosh/portainer-ce-without-annoying:lts`
 
 For example, if you use the command from the [official installation guide](https://docs.portainer.io/start/install-ce/server/docker/linux), the command will be:
 
@@ -32,7 +43,7 @@ docker run -d \
   --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v portainer_data:/data \
-  ghcr.io/notjosh/portainer-ce-without-annoying:latest
+  ghcr.io/notjosh/portainer-ce-without-annoying:lts
 ```
 
 Alternatively, you can use [this docker-compose.yml](https://github.com/notjosh/portainer-ce-without-annoying/blob/main/docker-compose.yml)

@@ -1,0 +1,10 @@
+[tools]
+node = { version = "24", postinstall = "corepack enable" }
+
+[tasks.typecheck]
+description = "Type-check scripts/ci_cd.js via its JSDoc annotations"
+run = ["pnpm install", "pnpm exec tsc --noEmit"]
+
+[tasks.dryrun]
+description = "Print what the CI build would do (tags to build, alias mapping), without docker"
+run = "node scripts/ci_cd.js dryrun=true"

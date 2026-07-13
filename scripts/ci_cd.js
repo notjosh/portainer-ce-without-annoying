@@ -1,33 +1,52 @@
+// @ts-check
 const path = require('path');
+const os = require('os');
+const fs = require('fs');
 const { spawn } = require('child_process');
 
 const ACCEPTED_TAGS_FROM = '2.17.0';
 const UPSTREAM_REPO = 'portainer/portainer-ce';
 const OUTPUT_OWNER = 'notjosh';
 const OUTPUT_PACKAGE = 'portainer-ce-without-annoying';
+const OUTPUT_IMAGE = `ghcr.io/${OUTPUT_OWNER}/${OUTPUT_PACKAGE}`;
 const NUMBER_OF_TAGS_REBUILD = 5;
 
-const shouldRebuild = !!process.argv.join(' ').match(/rebuild=true/);
+// Upstream tags that are moving pointers, not releases. We never *build* these:
+// we re-point them at our own numbered builds (see reconcileAliases).
+const ALIASES = ['latest', 'lts', 'sts'];
 
-function build_and_push(tag) {
-  const cwd = path.join(__dirname, '..');
-  const command = `TAG=${tag} ./scripts/build_and_push.sh`;
+// A plain release tag like "2.43.0" (also accepts "2.43" / "2"), i.e. not
+// suffixed variants like "2.43.0-alpine" and not alias tags.
+const NUMBERED_TAG_PATTERN = /^\d+(\.\d+){0,2}$/;
 
-  return new Promise(resolve => {
-    const subproc = spawn('/bin/sh', ['-c', command], { cwd });
-    subproc.stdout.pipe(process.stdout);
-    subproc.stderr.pipe(process.stderr);
-    subproc.on('close', () => resolve());
-  });
-}
+const MAX_HUB_PAGES = 5;
 
+const argv = process.argv.join(' ');
+const shouldRebuild = /rebuild=true/.test(argv);
+const isDryRun = /dryrun=true/.test(argv);
+
+/**
+ * @typedef {Object} HubTag
+ * @property {string} name
+ * @property {string | null} digest manifest (index) digest; missing on some older tags
+ * @property {string[]} imageDigests per-platform image digests, used as a fallback for matching
+ */
+
+/**
+ * @typedef {Object} BuildResult
+ * @property {string} tag
+ * @property {string} baseRef upstream ref the image was built FROM
+ * @property {string | null} digest digest of the pushed image, if buildx reported one
+ */
 
 /////////////////////////////////////
 
 /**
  * Prompt to ChatGPT: write js function that converts semver to int, for example 12.34.567 to 012034567. take into account case that input maybe 12.34 (output should be 012034000) or just 12 (output is 012000000)
+ *
+ * @param {string} semver
+ * @returns {number}
  */
-
 function semverToInt(semver) {
   const versionParts = semver.split('.');
   const paddedVersionParts = versionParts.map((part, index) => {
@@ -39,84 +58,327 @@ function semverToInt(semver) {
 
 /////////////////////////////////////
 
-// Fetch upstream (Docker Hub) tags for portainer/portainer-ce
-async function fetchUpstreamTags(repoName) {
-  const url = `https://hub.docker.com/v2/repositories/${repoName}/tags/?page_size=50&page=1`;
-  const response = await fetch(url);
-  return (await response.json())
-    .results.map(result => result.name)
-    .filter(t => t.match(/^(latest|[\d.]+)$/));
+/**
+ * Run a command, streaming its output. Rejects on spawn failure or non-zero exit.
+ *
+ * @param {string} command
+ * @param {string[]} args
+ * @param {{cwd?: string, env?: Record<string, string | undefined>}} [options]
+ * @returns {Promise<void>}
+ */
+function run(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const subproc = spawn(command, args, {
+      cwd: options.cwd,
+      env: options.env ?? process.env,
+    });
+    subproc.stdout.pipe(process.stdout);
+    subproc.stderr.pipe(process.stderr);
+    subproc.on('error', reject);
+    subproc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`${command} ${args.join(' ')} exited with code ${code}`));
+      }
+    });
+  });
 }
 
-// Fetch already-published tags from GHCR via GitHub Packages REST API.
-// Returns [] if the package doesn't exist yet (first run).
-async function fetchGhcrTags(owner, packageName) {
-  const headers = {
-    'Accept': 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-  };
-  if (process.env.GITHUB_TOKEN) {
-    headers['Authorization'] = `Bearer ${process.env.GITHUB_TOKEN}`;
-  }
+/**
+ * Build and push one numbered tag, FROM pinned to the given upstream ref.
+ *
+ * @param {string} tag
+ * @param {string} baseRef e.g. "portainer/portainer-ce@sha256:..."
+ * @returns {Promise<BuildResult>}
+ */
+async function build_and_push(tag, baseRef) {
+  const cwd = path.join(__dirname, '..');
+  const metadataFile = path.join(os.tmpdir(), `build-metadata-${tag}.json`);
 
-  const tags = new Set();
-  let page = 1;
-  while (true) {
-    const url = `https://api.github.com/users/${owner}/packages/container/${packageName}/versions?per_page=100&page=${page}`;
-    const response = await fetch(url, { headers });
-    if (response.status === 404) return [];
-    if (!response.ok) {
-      throw new Error(`GHCR API ${response.status}: ${await response.text()}`);
-    }
-    const versions = await response.json();
-    if (!Array.isArray(versions) || versions.length === 0) break;
-    for (const v of versions) {
-      for (const t of (v.metadata?.container?.tags ?? [])) tags.add(t);
-    }
-    if (versions.length < 100) break;
-    page++;
-  }
-  return [...tags].filter(t => t.match(/^(latest|[\d.]+)$/));
-}
+  await run('./scripts/build_and_push.sh', [], {
+    cwd,
+    env: {
+      ...process.env,
+      TAG: tag,
+      BASE_REF: baseRef,
+      METADATA_FILE: metadataFile,
+    },
+  });
 
-function findTagDifference(tagsA, tagsB) {
-  return tagsA.filter(tag => !tagsB.includes(tag));
-}
-
-async function processRepos(upstreamRepo, outputOwner, outputPackage) {
+  /** @type {string | null} */
+  let digest = null;
   try {
-    const tagsA = await fetchUpstreamTags(upstreamRepo);
-    const tagsB = await fetchGhcrTags(outputOwner, outputPackage);
-    console.log({ tagsA, tagsB });
+    const metadata = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
+    digest = metadata['containerimage.digest'] ?? null;
+  } catch {
+    // metadata is best-effort, only used for the run summary
+  }
+  return { tag, baseRef, digest };
+}
 
-    const tagDifference = shouldRebuild
-      ? [...tagsB]
-        .sort((a, b) => semverToInt(b) - semverToInt(a)) // sort desc
-        .filter(t => t !== 'latest')
-        .slice(0, NUMBER_OF_TAGS_REBUILD)
-      : findTagDifference(tagsA, tagsB);
+/////////////////////////////////////
 
-    // added by me
-    const acceptTagsFrom = semverToInt(ACCEPTED_TAGS_FROM);
-    const acceptedTags = tagDifference.filter(tag => semverToInt(tag) >= acceptTagsFrom);
-    acceptedTags.sort((a, b) => semverToInt(a) - semverToInt(b));
-    if (acceptedTags.length > 0) acceptedTags.push('latest');
+/**
+ * Fetch upstream (Docker Hub) tags with their digests. Paginates until every
+ * alias can be resolved to a numbered tag, capped at MAX_HUB_PAGES.
+ *
+ * @param {string} repoName
+ * @returns {Promise<HubTag[]>}
+ */
+async function fetchHubTags(repoName) {
+  /** @type {HubTag[]} */
+  const tags = [];
+  /** @type {string | null} */
+  let url = `https://hub.docker.com/v2/repositories/${repoName}/tags/?page_size=100&page=1`;
 
-    if (acceptedTags.length === 0) {
-      console.log('No new tags to build, exit now');
-      process.exit(0);
+  for (let page = 0; url !== null && page < MAX_HUB_PAGES; page++) {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Docker Hub API ${response.status}: ${await response.text()}`);
     }
-
-    console.log('Tags to build:', acceptedTags);
-    for (const tag of acceptedTags) {
-      console.log(`============= Building ${tag} =============`);
-      await build_and_push(tag);
-      console.log(`=============   Done ${tag}   =============`);
+    /** @type {{next: string | null, results: Array<{name: string, digest?: string | null, images?: Array<{os?: string, digest?: string | null}>}>}} */
+    const body = await response.json();
+    for (const result of body.results) {
+      tags.push({
+        name: result.name,
+        digest: result.digest ?? null,
+        imageDigests: (result.images ?? [])
+          // "unknown" entries are attestation manifests, not real platforms
+          .filter((image) => image.os !== 'unknown')
+          .flatMap((image) => (image.digest ? [image.digest] : [])),
+      });
     }
-  } catch (error) {
-    console.error('Error:', error.message);
-    process.exit(1);
+    const resolved = resolveAliases(tags);
+    if (ALIASES.every((alias) => resolved[alias] !== undefined)) break;
+    url = body.next;
+  }
+  return tags;
+}
+
+/**
+ * @param {HubTag} a
+ * @param {HubTag} b
+ * @returns {boolean}
+ */
+function sameManifest(a, b) {
+  if (a.digest && b.digest) return a.digest === b.digest;
+  // fallback for tags without a top-level digest: same set of platform images
+  if (a.imageDigests.length > 0 && b.imageDigests.length > 0) {
+    return (
+      a.imageDigests.every((digest) => b.imageDigests.includes(digest)) &&
+      b.imageDigests.every((digest) => a.imageDigests.includes(digest))
+    );
+  }
+  return false;
+}
+
+/**
+ * Map each alias tag to the numbered tag publishing the same manifest.
+ *
+ * Digest matching is load-bearing: upstream `latest` follows the LTS line
+ * (e.g. 2.39.4) while `sts` (e.g. 2.43.0) is newer, so "highest semver"
+ * would pick the wrong version. Do not "simplify" this.
+ *
+ * @param {HubTag[]} hubTags
+ * @returns {Record<string, string | undefined>} alias -> numbered tag
+ */
+function resolveAliases(hubTags) {
+  const numbered = hubTags.filter((tag) => NUMBERED_TAG_PATTERN.test(tag.name));
+  /** @type {Record<string, string | undefined>} */
+  const mapping = {};
+  for (const alias of ALIASES) {
+    const aliasTag = hubTags.find((tag) => tag.name === alias);
+    if (aliasTag === undefined) continue;
+    const matches = numbered.filter((tag) => sameManifest(aliasTag, tag));
+    // prefer the most specific match if several share a digest (e.g. 2.39 and 2.39.4)
+    matches.sort((a, b) => semverToInt(b.name) - semverToInt(a.name));
+    mapping[alias] = matches[0]?.name;
+  }
+  return mapping;
+}
+
+/**
+ * Fetch already-published tags from the GHCR registry API. Anonymous pull
+ * tokens work for public packages, so this needs no credentials (locally or
+ * in CI). Returns [] if the package doesn't exist yet (first run).
+ *
+ * @param {string} owner
+ * @param {string} packageName
+ * @returns {Promise<string[]>}
+ */
+async function fetchGhcrTags(owner, packageName) {
+  const tokenResponse = await fetch(
+    `https://ghcr.io/token?service=ghcr.io&scope=repository:${owner}/${packageName}:pull`
+  );
+  if (!tokenResponse.ok) {
+    throw new Error(`GHCR token exchange failed: ${tokenResponse.status}`);
+  }
+  /** @type {{token: string}} */
+  const { token } = await tokenResponse.json();
+
+  const response = await fetch(
+    `https://ghcr.io/v2/${owner}/${packageName}/tags/list?n=1000`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (response.status === 404) return [];
+  if (!response.ok) {
+    throw new Error(`GHCR API ${response.status}: ${await response.text()}`);
+  }
+  /** @type {{tags: string[] | null}} */
+  const body = await response.json();
+  return body.tags ?? [];
+}
+
+/////////////////////////////////////
+
+/**
+ * Point alias tags at our numbered builds via a manifest-only copy: no
+ * rebuild, and idempotent (re-pushing an identical manifest is a no-op).
+ *
+ * @param {Record<string, string | undefined>} aliasMap alias -> numbered tag
+ * @param {string[]} availableTags numbered tags known to exist in GHCR
+ * @returns {Promise<Record<string, string>>} alias -> outcome, for the summary
+ */
+async function reconcileAliases(aliasMap, availableTags) {
+  /** @type {Record<string, string>} */
+  const outcomes = {};
+  /** @type {string[]} */
+  const failures = [];
+
+  for (const alias of ALIASES) {
+    const target = aliasMap[alias];
+    if (target === undefined) {
+      console.warn(`WARNING: could not resolve upstream "${alias}" to a numbered tag, skipping`);
+      outcomes[alias] = 'unresolved upstream';
+      continue;
+    }
+    if (!availableTags.includes(target)) {
+      console.warn(`WARNING: "${alias}" maps to ${target}, but ${OUTPUT_IMAGE}:${target} does not exist, skipping`);
+      outcomes[alias] = `-> ${target} (missing, skipped)`;
+      continue;
+    }
+    console.log(`Pointing ${alias} -> ${target}`);
+    try {
+      await run('docker', ['buildx', 'imagetools', 'create', '-t', `${OUTPUT_IMAGE}:${alias}`, `${OUTPUT_IMAGE}:${target}`]);
+      outcomes[alias] = `-> ${target}`;
+    } catch (error) {
+      failures.push(`${alias}: ${error instanceof Error ? error.message : error}`);
+      outcomes[alias] = `-> ${target} (FAILED)`;
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(`alias reconciliation failed:\n${failures.join('\n')}`);
+  }
+  return outcomes;
+}
+
+/**
+ * Append a markdown summary to the GitHub Actions run page (or stdout locally),
+ * so "what does latest point to" is answerable per-run.
+ *
+ * @param {BuildResult[]} built
+ * @param {Record<string, string | undefined>} aliasMap
+ * @param {Record<string, string>} aliasOutcomes
+ * @param {HubTag[]} hubTags
+ */
+function writeSummary(built, aliasMap, aliasOutcomes, hubTags) {
+  const lines = ['## Build and push summary', '', '### Built tags', ''];
+  if (built.length === 0) {
+    lines.push('_No new tags to build._');
+  } else {
+    lines.push('| Tag | Built from | Pushed digest |', '|---|---|---|');
+    for (const result of built) {
+      lines.push(`| \`${result.tag}\` | \`${result.baseRef}\` | \`${result.digest ?? 'unknown'}\` |`);
+    }
+  }
+  lines.push('', '### Alias tags', '', '| Alias | Upstream digest | Outcome |', '|---|---|---|');
+  for (const alias of ALIASES) {
+    const upstreamDigest = hubTags.find((tag) => tag.name === alias)?.digest ?? 'unknown';
+    lines.push(`| \`${alias}\` | \`${upstreamDigest}\` | ${aliasOutcomes[alias] ?? aliasMap[alias] ?? 'unresolved'} |`);
+  }
+  lines.push('');
+
+  const markdown = lines.join('\n');
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown + '\n');
+  }
+  console.log(markdown);
+}
+
+/////////////////////////////////////
+
+/**
+ * @param {string} upstreamRepo
+ * @param {string} outputOwner
+ * @param {string} outputPackage
+ */
+async function processRepos(upstreamRepo, outputOwner, outputPackage) {
+  const hubTags = await fetchHubTags(upstreamRepo);
+  const aliasMap = resolveAliases(hubTags);
+  const ghcrTags = await fetchGhcrTags(outputOwner, outputPackage);
+  const ghcrNumbered = ghcrTags.filter((tag) => NUMBERED_TAG_PATTERN.test(tag));
+
+  const acceptTagsFrom = semverToInt(ACCEPTED_TAGS_FROM);
+  const hubNumbered = hubTags
+    .map((tag) => tag.name)
+    .filter((name) => NUMBERED_TAG_PATTERN.test(name) && semverToInt(name) >= acceptTagsFrom);
+
+  console.log({ hubNumbered, ghcrNumbered, aliasMap });
+
+  /** @type {string[]} */
+  let tagsToBuild;
+  if (shouldRebuild) {
+    tagsToBuild = [...ghcrNumbered]
+      .sort((a, b) => semverToInt(b) - semverToInt(a)) // sort desc
+      .slice(0, NUMBER_OF_TAGS_REBUILD);
+  } else {
+    // new upstream releases, plus alias targets we somehow missed; the latter
+    // closes the gap in a single run instead of waiting for the next release
+    const wanted = new Set(hubNumbered.filter((name) => !ghcrNumbered.includes(name)));
+    for (const target of Object.values(aliasMap)) {
+      if (target !== undefined && !ghcrNumbered.includes(target) && semverToInt(target) >= acceptTagsFrom) {
+        wanted.add(target);
+      }
+    }
+    tagsToBuild = [...wanted];
+  }
+  tagsToBuild.sort((a, b) => semverToInt(a) - semverToInt(b));
+
+  console.log('Tags to build:', tagsToBuild);
+  console.log('Alias plan:', aliasMap);
+
+  if (isDryRun) {
+    console.log('Dry run, stopping here.');
+    return;
+  }
+
+  /** @type {BuildResult[]} */
+  const built = [];
+  for (const tag of tagsToBuild) {
+    // pin FROM by digest so the build is unambiguous even if upstream re-tags
+    const hubTag = hubTags.find((candidate) => candidate.name === tag);
+    const baseRef = hubTag?.digest
+      ? `${upstreamRepo}@${hubTag.digest}`
+      : `${upstreamRepo}:${tag}`;
+
+    console.log(`============= Building ${tag} (from ${baseRef}) =============`);
+    built.push(await build_and_push(tag, baseRef));
+    console.log(`=============   Done ${tag}   =============`);
+  }
+
+  const availableTags = [...new Set([...ghcrNumbered, ...built.map((result) => result.tag)])];
+  /** @type {Record<string, string>} */
+  let aliasOutcomes = {};
+  try {
+    aliasOutcomes = await reconcileAliases(aliasMap, availableTags);
+  } finally {
+    writeSummary(built, aliasMap, aliasOutcomes, hubTags);
   }
 }
 
-processRepos(UPSTREAM_REPO, OUTPUT_OWNER, OUTPUT_PACKAGE);
+processRepos(UPSTREAM_REPO, OUTPUT_OWNER, OUTPUT_PACKAGE).catch((error) => {
+  console.error('Error:', error instanceof Error ? error.message : error);
+  process.exit(1);
+});
