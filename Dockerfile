@@ -5,7 +5,7 @@ FROM node:24-alpine
 # proxy layers first: they are identical for every tag, so they stay
 # cacheable across builds; the portainer copy below differs per tag
 WORKDIR /proxy
-RUN npm i express http-proxy-middleware
+RUN npm i express@5 http-proxy-middleware@4
 COPY app.js .
 COPY docker-entrypoint.sh /
 
